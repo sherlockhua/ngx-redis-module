@@ -19,7 +19,6 @@ typedef struct {
 
 
 typedef struct {
-    //memcache结尾的长度
     size_t                     rest;
     ngx_http_request_t        *request;
     ngx_str_t                  key;
