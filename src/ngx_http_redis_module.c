@@ -58,6 +58,9 @@ static char *ngx_http_redis_merge_loc_conf(ngx_conf_t *cf,
 static char *ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
+static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, 
+    ngx_array_t *array, ngx_chain_t **out);
+
 
 static ngx_conf_bitmask_t  ngx_http_redis_next_upstream_masks[] = {
     { ngx_string("error"), NGX_HTTP_UPSTREAM_FT_ERROR },
@@ -318,13 +321,15 @@ ngx_http_redis_pack_get(ngx_http_request_t *r, u_char* p, u_char* last,
 
     item = ngx_array_push(&redis_array);
     item->type = NGX_HTTP_REDIS_BUF_STR;
-    item->val = ngx_string("get");
+    item->val.data = (u_char*)"get";
+    item->val.len = sizeof("get") - 1;
 
     item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
     escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
     if (escape) {
         item->val.data = (u_char*)ngx_palloc(r->pool, escape + v->len);
-        char *end = (char*)ngx_escape_uri(item->val, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+        u_char *end = (u_char*)ngx_escape_uri(item->val.data, v->data, v->len, NGX_ESCAPE_MEMCACHED);
        
         item->val.len = end - item->val.data;
     } else {
@@ -334,70 +339,103 @@ ngx_http_redis_pack_get(ngx_http_request_t *r, u_char* p, u_char* last,
     }
 
     return ngx_http_redis_pack(r, &redis_array, cl);
-    /*
-    ngx_buf_t *buf;
-    ngx_int_t escape = 0;
-    ngx_int_t buf_len = 0;
-
-    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
-    buf_len = sizeof("*2\r\n") - 1 + sizeof("$3\r\n") - 1 + 
-              sizeof("get\r\n") - 1 + sizeof("$10000000\r\n") - 1 + v->len + escape + sizeof("\r\n") - 1;
-
-    buf = ngx_create_temp_buf(r->pool, buf_len);
-    *buf->last++ = '*';
-    *buf->last++ = '2';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *buf->last++ = '$';
-    *buf->last++ = '3';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *buf->last++ = 'g';
-    *buf->last++ = 'e';
-    *buf->last++ = 't';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    buf->last = ngx_snprintf(buf->last, buf->end - buf->last, "$%d", v->len + escape);
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    if (escape) {
-        buf->last = (u_char*)ngx_escape_uri(buf->last, v->data, v->len, NGX_ESCAPE_MEMCACHED);
-    } else {
-        buf->last = ngx_copy(buf->last, v->data, v->len);
-    }
-
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *cl = ngx_alloc_chain_link(r->pool);
-    if (*cl == NULL) {
-        return NGX_ERROR;
-    }
-
-    buf->last_buf = 1;
-    (*cl)->buf = buf;
-    (*cl)->next = NULL;
-
-    return NGX_OK;
-    */
 }
 
 static ngx_int_t
 ngx_http_redis_pack_getset(ngx_http_request_t *r, u_char* p, u_char* last,
         ngx_variable_value_t *v, ngx_chain_t **cl)
 {
-    return NGX_OK;
+
+    ngx_array_t redis_array;
+    ngx_int_t escape = 0;
+    ngx_http_redis_buf_t *item;
+    ngx_http_upstream_t *u = r->upstream;
+
+    if (!u->request_bufs) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_array_init(&redis_array, r->pool, 8, sizeof(ngx_http_redis_buf_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val.data = (u_char*)"getset";
+    item->val.len = sizeof("getset") - 1;
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+    if (escape) {
+        item->val.data = (u_char*)ngx_palloc(r->pool, escape + v->len);
+        u_char *end = (u_char*)ngx_escape_uri(item->val.data, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+       
+        item->val.len = end - item->val.data;
+    } else {
+        item->val.data = (u_char*)ngx_palloc(r->pool, v->len);
+        u_char* end = ngx_copy(item->val.data, v->data, v->len);
+        item->val.len = end - item->val.data;
+    }
+
+    //value
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_CHAIN;
+    item->chain = u->request_bufs;
+
+    return ngx_http_redis_pack(r, &redis_array, cl);
 }
 
 static ngx_int_t
 ngx_http_redis_pack_getbit(ngx_http_request_t *r, u_char* p, u_char* last,
         ngx_variable_value_t *v, ngx_chain_t **cl)
 {
-    return NGX_OK;
+    ngx_array_t redis_array;
+    ngx_int_t escape = 0;
+    ngx_http_redis_buf_t *item;
+    ngx_str_t offset = ngx_null_string;
+
+    if (ngx_array_init(&redis_array, r->pool, 8, sizeof(ngx_http_redis_buf_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val.data = (u_char*)"getbit";
+    item->val.len = sizeof("getbit") - 1;
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+    if (escape) {
+        item->val.data = (u_char*)ngx_palloc(r->pool, escape + v->len);
+        u_char *end = (u_char*)ngx_escape_uri(item->val.data, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+       
+        item->val.len = end - item->val.data;
+    } else {
+        item->val.data = (u_char*)ngx_palloc(r->pool, v->len);
+        u_char* end = ngx_copy(item->val.data, v->data, v->len);
+        item->val.len = end - item->val.data;
+    }
+
+    //start
+    offset.data = p;
+    offset.len = last - p;
+
+    if (offset.len == 0) {
+        return NGX_ERROR;
+    }
+
+    //start
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val = offset;
+
+    return ngx_http_redis_pack(r, &redis_array, cl);
 }
 
 static ngx_int_t ngx_http_redis_get_buf_len(ngx_int_t len)
@@ -429,24 +467,24 @@ static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, ngx_array_t *array, 
 {
     ngx_chain_t **cl;
     ngx_buf_t *buf;
-    ngx_int_t escape = 0;
+    //ngx_int_t escape = 0;
     ngx_int_t buf_len = 0;
-    ngx_int_t index = 0;
+    ngx_uint_t index = 0;
 
     *out = ngx_alloc_chain_link(r->pool);
     if (*out == NULL) {
         return NGX_ERROR;
     }
 
-    *cl = out;
-    buf_len = ngx_http_redis_get_buf_len(array->nelts);
+    cl = out;
+    buf_len = ngx_http_redis_get_buf_len(array->nelts) + sizeof("\r\n") - 1;
     buf = ngx_create_temp_buf(r->pool, buf_len);
     //header(*xx)
     buf->last = ngx_snprintf(buf->last, buf->end - buf->last, "*%d\r\n", array->nelts);
     (*cl)->buf = buf;
     (*cl)->next = NULL; 
 
-    cl = &(out->next);
+    cl = &((*out)->next);
     ngx_http_redis_buf_t *elts = array->elts;
     for (; index < array->nelts; index++) {
         buf_len = 0;
@@ -469,13 +507,18 @@ static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, ngx_array_t *array, 
             *buf->last++ = '\n';
 
             (*cl)->buf = buf;
-            cl = &cl->next;
+            cl = &((*cl)->next);
         } else {
             ngx_int_t chain_len = 0;
-            ngx_chain_t **tail = &redis_buf.chain;
-            while (*tail) {
-                chain_len += ngx_buf_size((*tail)->buf);
-                *tail = &(*tail)->next;
+            ngx_chain_t *p = redis_buf.chain;
+            ngx_chain_t **tail = &p;
+            while (p) {
+                chain_len += ngx_buf_size(p->buf);
+                p->buf->last_buf = 0;
+
+                tail = &(p->next);
+                p = p->next;
+
             }
 
             buf_len = ngx_http_redis_get_buf_len(chain_len) + sizeof("\r\n") - 1;
@@ -483,7 +526,7 @@ static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, ngx_array_t *array, 
             buf->last = ngx_snprintf(buf->last, buf->end - buf->last, "$%d\r\n", chain_len);
 
             (*cl)->buf = buf;
-            cl = &cl->next;
+            cl = &((*cl)->next);
 
             *cl = redis_buf.chain;
 
@@ -495,65 +538,78 @@ static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, ngx_array_t *array, 
             buf->last_buf = 1;
 
             *tail =  ngx_alloc_chain_link(r->pool);
-            *tail->buf = buf;
-            *tail->next = NULL;
+            (*tail)->buf = buf;
+            (*tail)->next = NULL;
         }
     }
     
+    return NGX_OK;
 }
 
 static ngx_int_t
 ngx_http_redis_pack_getrange(ngx_http_request_t *r, u_char* p, u_char* last,
         ngx_variable_value_t *v, ngx_chain_t **cl)
 {
-    ngx_buf_t *buf;
+    ngx_array_t redis_array;
     ngx_int_t escape = 0;
-    ngx_int_t buf_len = 0;
+    ngx_http_redis_buf_t *item;
+    ngx_str_t start = ngx_null_string, end = ngx_null_string;
 
-    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
-    buf_len = sizeof("*2\r\n") - 1 + sizeof("$3\r\n") - 1 + 
-              sizeof("get\r\n") - 1 + sizeof("$10000000\r\n") - 1 + v->len + escape + sizeof("\r\n") - 1;
-
-    buf = ngx_create_temp_buf(r->pool, buf_len);
-    *buf->last++ = '*';
-    *buf->last++ = '2';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *buf->last++ = '$';
-    *buf->last++ = '3';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *buf->last++ = 'g';
-    *buf->last++ = 'e';
-    *buf->last++ = 't';
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    buf->last = ngx_snprintf(buf->last, buf->end - buf->last, "$%d", v->len + escape);
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    if (escape) {
-        buf->last = (u_char*)ngx_escape_uri(buf->last, v->data, v->len, NGX_ESCAPE_MEMCACHED);
-    } else {
-        buf->last = ngx_copy(buf->last, v->data, v->len);
-    }
-
-    *buf->last++ = '\r';
-    *buf->last++ = '\n';
-
-    *cl = ngx_alloc_chain_link(r->pool);
-    if (*cl == NULL) {
+    if (ngx_array_init(&redis_array, r->pool, 8, sizeof(ngx_http_redis_buf_t))
+        != NGX_OK)
+    {
         return NGX_ERROR;
     }
 
-    buf->last_buf = 1;
-    (*cl)->buf = buf;
-    (*cl)->next = NULL;
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val.data = (u_char*)"getrange";
+    item->val.len = sizeof("getrange") - 1;
 
-    return NGX_OK;
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+    if (escape) {
+        item->val.data = (u_char*)ngx_palloc(r->pool, escape + v->len);
+        u_char *end = (u_char*)ngx_escape_uri(item->val.data, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+       
+        item->val.len = end - item->val.data;
+    } else {
+        item->val.data = (u_char*)ngx_palloc(r->pool, v->len);
+        u_char* end = ngx_copy(item->val.data, v->data, v->len);
+        item->val.len = end - item->val.data;
+    }
+
+    //start
+    start.data = p;
+    for (; p < last; p++) {
+       if (*p == '&') {
+           start.len = p - start.data;
+           if (p + 1 == last) {
+               return NGX_ERROR;
+           }
+
+           end.data = p + 1;
+           end.len = last - p - 1;
+       } 
+    }
+
+    if (start.len == 0 || end.len == 0) {
+        return NGX_ERROR;
+    }
+
+    //start
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val = start;
+
+    //end
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val = end;
+
+    return ngx_http_redis_pack(r, &redis_array, cl);
+ 
 }
 
 static ngx_int_t
@@ -566,6 +622,7 @@ ngx_http_redis_process_get(ngx_http_request_t *r, u_char* p, u_char* last,
 
     for (; p < last; p++) {
         if (*p == '&') {
+            p++;
             break;
         }
 
@@ -730,6 +787,10 @@ found:
                 if (u->headers_in.content_length_n == -1) {
                     u->headers_in.status_n = 404;
                     u->state->status = 404;
+                }else {
+                    u->headers_in.status_n = 200;
+                    u->state->status = 200;
+                    u->buffer.pos = p + 1;
                 }
             } 
     }
