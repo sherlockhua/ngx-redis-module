@@ -1,7 +1,7 @@
 
 /*
- * Copyright (C) Igor Sysoev
- * Copyright (C) Nginx, Inc.
+ * Copyright (C) sherlockhua
+ * Copyright (C) sherlockhua, Inc.
  */
 
 
