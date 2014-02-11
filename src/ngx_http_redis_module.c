@@ -15,7 +15,91 @@ typedef struct {
     ngx_http_upstream_conf_t   upstream;
     ngx_int_t                  index;
     ngx_uint_t                 gzip_flag;
+    ngx_hash_t command_hash;
 } ngx_http_redis_loc_conf_t;
+
+typedef ngx_int_t (*ngx_http_redis_pack_pt)(ngx_http_request_t *r, u_char* p, 
+        u_char* last,ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_append(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_get(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_getset(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_getbit(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_getrange(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_bgrewriteaof(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_bgsave(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_dbsize(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl);
+
+static ngx_int_t
+ngx_http_redis_pack_single_command(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl, char* command);
+
+typedef struct {
+    ngx_str_t                        name;
+    ngx_http_redis_pack_pt           create_request_handler;
+} ngx_http_redis_command_process_t;
+
+ngx_http_redis_command_process_t  ngx_http_redis_command_proc[] = {
+    {
+        ngx_string("get"),
+        ngx_http_redis_pack_get},
+
+    {
+        ngx_string("getset"),
+        ngx_http_redis_pack_getset},
+
+    {
+        ngx_string("getbit"),
+        ngx_http_redis_pack_getbit},
+
+    {
+        ngx_string("getrange"),
+        ngx_http_redis_pack_getrange},
+    {
+        ngx_string("append"),
+        ngx_http_redis_pack_append},
+
+    {
+        ngx_string("bgrewriteaof"),
+        ngx_http_redis_pack_bgrewriteaof,
+    },
+    {
+        ngx_string("bgsave"),
+        ngx_http_redis_pack_bgsave,
+    },
+    {
+        ngx_string("dbsize"),
+        ngx_http_redis_pack_dbsize,
+    },
+    {
+        ngx_null_string,
+        NULL}
+};
+
+
 
 #define NGX_HTTP_REDIS_BUF_CHAIN 1
 #define NGX_HTTP_REDIS_BUF_STR   2
@@ -34,6 +118,7 @@ typedef struct {
     size_t                     rest;
     ngx_http_request_t        *request;
     ngx_str_t                  key;
+    ngx_hash_t command_hash;
 } ngx_http_redis_ctx_t;
 
 #define NGX_REDIS_METHOD_NONE    -1
@@ -214,6 +299,7 @@ ngx_http_redis_handler(ngx_http_request_t *r)
 
     ctx->rest = NGX_HTTP_REDIS_END;
     ctx->request = r;
+    ctx->command_hash = mlcf->command_hash;
 
     ngx_http_set_ctx(r, ctx, ngx_http_redis_module);
 
@@ -232,6 +318,47 @@ ngx_http_redis_handler(ngx_http_request_t *r)
 
     return NGX_DONE;
 }
+
+static ngx_int_t ngx_http_redis_init_handle(ngx_conf_t *cf, 
+        ngx_http_redis_loc_conf_t *mlcf) 
+{
+    ngx_array_t commands;
+    ngx_http_redis_command_process_t *command;
+    ngx_hash_key_t                 *hk;
+    ngx_hash_init_t                 hash;
+
+    if (ngx_array_init(&commands, cf->temp_pool, 32, sizeof(ngx_hash_key_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    for (command = ngx_http_redis_command_proc; command->name.len; command++) {
+        hk = ngx_array_push(&commands);
+        if (hk == NULL) {
+            return NGX_ERROR;
+        }
+
+        hk->key = command->name;
+        hk->key_hash = ngx_hash_key_lc(command->name.data, command->name.len);
+        hk->value = command;
+    }
+
+    hash.hash = &mlcf->command_hash;
+    hash.key = ngx_hash_key_lc;
+    hash.max_size = 512;
+    hash.bucket_size = ngx_align(64, ngx_cacheline_size);
+    hash.name = "ngx_http_redis_command_proc_hash";
+    hash.pool = cf->pool;
+    hash.temp_pool = NULL;
+
+    if (ngx_hash_init(&hash, commands.elts, commands.nelts) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
 
 /*
  *创建一个request，用来与后端服务交互。
@@ -340,6 +467,54 @@ ngx_http_redis_pack_get(ngx_http_request_t *r, u_char* p, u_char* last,
 
     return ngx_http_redis_pack(r, &redis_array, cl);
 }
+
+static ngx_int_t
+ngx_http_redis_pack_append(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl)
+{
+
+    ngx_array_t redis_array;
+    ngx_int_t escape = 0;
+    ngx_http_redis_buf_t *item;
+    ngx_http_upstream_t *u = r->upstream;
+
+    if (!u->request_bufs) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_array_init(&redis_array, r->pool, 8, sizeof(ngx_http_redis_buf_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val.data = (u_char*)"append";
+    item->val.len = sizeof("append") - 1;
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    escape = 2 * ngx_escape_uri(NULL, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+    if (escape) {
+        item->val.data = (u_char*)ngx_palloc(r->pool, escape + v->len);
+        u_char *end = (u_char*)ngx_escape_uri(item->val.data, v->data, v->len, NGX_ESCAPE_MEMCACHED);
+       
+        item->val.len = end - item->val.data;
+    } else {
+        item->val.data = (u_char*)ngx_palloc(r->pool, v->len);
+        u_char* end = ngx_copy(item->val.data, v->data, v->len);
+        item->val.len = end - item->val.data;
+    }
+
+    //value
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_CHAIN;
+    item->chain = u->request_bufs;
+
+    return ngx_http_redis_pack(r, &redis_array, cl);
+}
+
 
 static ngx_int_t
 ngx_http_redis_pack_getset(ngx_http_request_t *r, u_char* p, u_char* last,
@@ -547,6 +722,52 @@ static ngx_int_t ngx_http_redis_pack(ngx_http_request_t *r, ngx_array_t *array, 
 }
 
 static ngx_int_t
+ngx_http_redis_pack_bgsave(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl)
+{
+    return ngx_http_redis_pack_single_command(r, p, last, v, cl, "bgsave");
+}
+
+
+static ngx_int_t
+ngx_http_redis_pack_dbsize(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl)
+{
+    return ngx_http_redis_pack_single_command(r, p, last, v, cl, "dbsize");
+}
+
+
+
+static ngx_int_t
+ngx_http_redis_pack_bgrewriteaof(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl)
+{
+    return ngx_http_redis_pack_single_command(r, p, last, v, cl, "bgrewriteaof");
+}
+
+static ngx_int_t
+ngx_http_redis_pack_single_command(ngx_http_request_t *r, u_char* p, u_char* last,
+        ngx_variable_value_t *v, ngx_chain_t **cl, char *command)
+{
+    ngx_array_t redis_array;
+    ngx_http_redis_buf_t *item;
+
+    if (ngx_array_init(&redis_array, r->pool, 8, sizeof(ngx_http_redis_buf_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    item = ngx_array_push(&redis_array);
+    item->type = NGX_HTTP_REDIS_BUF_STR;
+    item->val.data = (u_char*)command;
+    item->val.len = strlen(command);
+
+    return ngx_http_redis_pack(r, &redis_array, cl);
+ 
+}
+
+static ngx_int_t
 ngx_http_redis_pack_getrange(ngx_http_request_t *r, u_char* p, u_char* last,
         ngx_variable_value_t *v, ngx_chain_t **cl)
 {
@@ -612,6 +833,7 @@ ngx_http_redis_pack_getrange(ngx_http_request_t *r, u_char* p, u_char* last,
  
 }
 
+/*
 static ngx_int_t
 ngx_http_redis_process_get(ngx_http_request_t *r, u_char* p, u_char* last,
         ngx_variable_value_t *v, ngx_chain_t **cl)
@@ -695,22 +917,28 @@ ngx_http_redis_process_get(ngx_http_request_t *r, u_char* p, u_char* last,
 
     return NGX_HTTP_BAD_REQUEST;
 }
+*/
 
 static ngx_int_t
 ngx_http_redis_create_request(ngx_http_request_t *r)
 {
     ngx_int_t                 rc = NGX_ERROR;
     ngx_http_redis_loc_conf_t   *rlcf;
-    //ngx_http_redis_ctx_t        *ctx;
+    ngx_http_redis_ctx_t        *ctx;
     ngx_http_variable_value_t *vv;
 
     ngx_http_upstream_t            *u = r->upstream;
     ngx_chain_t                   *cl = NULL;
     u_char  *p, *last;
+    ngx_str_t command;
+    ngx_int_t command_hash = 0;
+    ngx_http_redis_command_process_t *proc;
 
     if (r->args.len == 0) {
         return NGX_ERROR;
     }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_redis_module);
 
     rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
     vv = ngx_http_get_indexed_variable(r, rlcf->index);
@@ -724,14 +952,36 @@ ngx_http_redis_create_request(ngx_http_request_t *r)
     p = r->args.data;
     last = p + r->args.len;
 
+    for (; p != last; p++) {
+        if (*p == '&') {
+            break;
+        }
+
+    }
+
+    command.data = r->args.data;
+    command.len = p - command.data;
+
+    command_hash = ngx_hash_key_lc(command.data, command.len);
+
+    proc = ngx_hash_find(&ctx->command_hash, command_hash, command.data, command.len);
+    if (proc && proc->create_request_handler) {
+        rc = proc->create_request_handler(r, p+1, last, vv, &cl);
+    }
+/*
     switch (*p) {
         case 'g':
         case 'G':
             rc = ngx_http_redis_process_get(r, p, last, vv, &cl);
             break;
+        case 'A':
+        case 'a':
+            rc = ngx_http_redis_process_append(r, p, last, vv, &cl);
+            break;
         default:
             break;
     }
+*/
 
     if (rc != NGX_OK) {
         return rc;
@@ -1038,6 +1288,7 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_str_t                 *value;
     ngx_url_t                  u;
     ngx_http_core_loc_conf_t  *clcf;
+    ngx_int_t                   rc;
 
     if (mlcf->upstream.upstream) {
         return "is duplicate";
@@ -1066,6 +1317,11 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mlcf->index = ngx_http_get_variable_index(cf, &ngx_http_redis_key);
 
     if (mlcf->index == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    rc = ngx_http_redis_init_handle(cf, mlcf);
+    if (rc != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
